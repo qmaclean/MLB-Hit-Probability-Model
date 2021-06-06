@@ -1,0 +1,660 @@
+---
+title: "Expected Hits Model"
+author: "Quinn MacLean"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(baseballr)
+library(caret)
+library(ggplot2)
+#devtools::install_github("bdilday/GeomMLBStadiums")
+library(GeomMLBStadiums)
+library(eeptools)
+library(kableExtra)
+
+
+
+df<-read.csv(file="baseball_scraped_data.csv")
+
+mlb_salary<-read.csv(file="MLB_FA_salary_data.csv")
+
+df<- df %>%
+  mutate(RUNS.SCORED = post_bat_score - bat_score)
+
+unique(df$events)
+df$events_out<-ifelse(df$events%in% c('strikeout','sac_fly','field_out','force_out','grounded_into_double_play',
+                                      'sac_bunt','double_play','other_out','caught_stealing_2b','fielders_choice',
+                                      'fielders_choice_out','sac_bunt_double_play','strikeout_double_play',
+                                      'pickoff_1b','sac_fly_double_play','triple_play','caught_stealing_3b',
+                                      'pickoff_caught_stealing_3b','pickoff_caught_stealing_2b',
+                                      'pickoff_2b'),1,0)
+
+### individual streaks ###
+
+# predicting bounce backs of streaks
+df<-df %>%
+  mutate(H = ifelse(df$events %in% c('single','triple','home_run','double'),1,0))
+
+
+spray_chart<-function(...) {
+  ggplot(...) +
+    geom_curve(x = 33,xend = 223,y = -100,yend =-100,
+               curvature = -.65) +
+    geom_segment(x=128, xend=33,y=-208,yend=-100) + 
+    geom_segment(x=128,xend=223,y=-208,yend=-100) + 
+    geom_curve(x=83,xend=173,y=-155,yend=-156,
+               curvature = -.65,linetype="dotted") +
+    coord_fixed() + 
+    scale_x_continuous(NULL,limits = c(25,225)) +
+    scale_y_continuous(NULL,limits = c(-225,-25))
+}
+
+bip<- df %>%
+  filter(type == "X") 
+
+mlb_ids<-read.csv(file="mlb_baseball_ids.csv")
+
+#https://www.smartfantasybaseball.com/tools/
+
+bip$Hit<-ifelse(bip$events %in% c('single','triple','home_run','double'),1,0)
+bip$hard_hit_bip<-ifelse(bip$launch_speed >= 95,1,0)
+bip$hard_hit<-ifelse(bip$hard_hit_bip == 1 & bip$Hit == 1,1,0)
+
+bip<-bip %>%
+  left_join(mlb_ids,bip,by=c("batter" = "MLBID"))
+
+#bip$batter_name<-paste(bip$name_first,bip$name_last,sep=", ")
+bip$hard_hit_launch_angle<-ifelse(bip$hard_hit_bip == 1,bip$launch_angle,NA)
+bip$hard_hit_result_launch_angle<-ifelse(bip$hard_hit == 1,bip$launch_angle,NA)
+
+
+
+
+```
+
+## Introduction
+
+The purpose of this analysis is to model the probability of a hit given a ball in play. We will use this model to evaluate and find the batter that had the most hits added vs. expected. We will also see what variables contribute to a higher probability of hits as a way to compare players. We will have data from the current 2021 season through the end of May. The two months of data will be used to build our preliminary model. 
+
+### Exploratory Analysis
+We see that most balls into place are shallow outfield and that those balls hit into the infield are likely outs. We can derive that line-drive hits are more likely to become hits. 
+```{r a1,echo=FALSE,message=FALSE,warning=FALSE}
+
+
+
+bip %>%
+spray_chart(aes(x=hc_x,y=-hc_y)) +
+  geom_point(aes(color=bb_type),alpha=1/10) +
+  #scale_color_grey() +
+  theme(legend.position = "bottom") +
+  facet_wrap(~events_out,labeller = label_both) +
+  ggtitle("Balls in play by Out Events") +
+  scale_color_brewer(palette = "BuGn") +
+theme(plot.title = element_text(size=10))
+
+```
+
+Line drives can be determined from a batter's launch angle and speed. Fangraphs derived that ground balls are less than 10 degrees, line drives are between 10-26 degrees, fly balls are 26-39 degrees and pop-ups are greater than 39 degrees.  You can see the light orange below are those with the launch angle of 10 -26 degrees. 
+
+Link:  https://fantasy.fangraphs.com/anglebbtypes/
+```{r a2,echo=FALSE,message=FALSE,warning=FALSE}
+
+spray_chart(bip, aes(x=hc_x,y=-hc_y)) +
+  geom_point(aes(color=launch_angle),alpha=1/10) +
+  #scale_color_grey() +
+  theme(legend.position = "bottom") +
+  facet_wrap(~events_out,labeller = label_both) +
+  ggtitle("Balls in play by Launch Angle") +
+  scale_color_gradientn(colors = terrain.colors(10)) +
+theme(plot.title = element_text(size=10))
+
+```
+
+Launch angle isn't the only variable as the exit velocity or launch speed can determine how hard the ball comes of the bat. MLB Statcast defines a hard hit is those with a launch speed of greater than 95. We can see there's a high concentration of batter's with hard hits overall. 
+```{r a3,echo=FALSE,message=FALSE,warning=FALSE}
+
+bip$H<-ifelse(bip$events %in% c('single','triple','home_run','double'),1,0)
+bip$H<-ifelse(bip$H== 0,"1. No Hit","2. Hit")
+
+ggplot(bip,aes(y=launch_speed,x=launch_angle,color=H)) +
+   geom_density_2d(aes(fill=hit_distance_sc)) +
+  ggtitle("launch angle to speed density plot") + 
+  theme(plot.title = element_text(size=10))
+  
+
+
+
+```
+
+Nick Castellanos & JD Martinez have a conistent launch angle for hard hit balls in play, which results in a higher percentage of hits as a result. Eric Hosmer has the lowest average launch angle resulting in a lower conversion of his hard hit balls resulting in hits. His average launch angle of 4 degrees is likely a hard hit ground ball, which has been fielded appropriately. 
+```{r a4,echo=FALSE,message=FALSE,warning=FALSE}
+
+
+
+a<-bip %>%
+  dplyr::group_by(batter,PLAYERNAME,TEAM,ALLPOS) %>%
+  dplyr::summarize(hard_hit_bip = sum(hard_hit_bip),
+                   hard_hit = sum(hard_hit),
+                   hard_hit_pct = round(sum(hard_hit) / sum(hard_hit_bip),2),
+                   `Launch Angle Median of Hard Hit BIP` = median(hard_hit_launch_angle,na.rm=TRUE),
+                   `Launch Angle Median of Hard Hit` = median(hard_hit_result_launch_angle,na.rm=TRUE)) %>%
+  dplyr::filter(hard_hit_bip >= 70) %>%
+  dplyr::arrange(desc(hard_hit_pct)) 
+
+a %>%
+  kable(caption = "Hard Hit Percentage",booktabs = T) %>%
+  kable_styling(font_size = 10,bootstrap_options = c("condensed")) %>%
+   row_spec(which(a$hard_hit_pct <= 0.45),bold = T,color = "white",background = "grey") %>%
+  row_spec(which(a$hard_hit_pct >= 0.60),bold = T,color = "white",background = "green") %>%
+  footnote(general = "Filtered for at least 70 hard hits","Green > 60% Hard Hit Percentage, Grey <45% Hard Hit Percenatage") 
+
+
+```
+
+If we view Nick Castellanos hard hits solely in both home and NL Central ballparks during the 2021 season (thru end of May). We can see how much he stretches the hit at home. Even at Wrigley, he's hit hard line drives between Left & Center. His aim & velocity has contributed to his early season success. 
+
+```{r a5,echo=FALSE,message=FALSE,warning=FALSE}
+
+#unique(subset(bip,bip$batter == "592206")$home_team)
+
+bp<-subset(bip,bip$batter == "592206")
+bp<-subset(bp,bp$home_team %in% c('CIN','CHC','PIT','STL','MIL'))
+
+bp$home_team<-ifelse(bp$home_team == "CIN","reds",
+              ifelse(bp$home_team == "CHC","cubs",
+              ifelse(bp$home_team == "WSH","nationals",
+              ifelse(bp$home_team == "COL","rockies",
+              ifelse(bp$home_team == "PIT","pirates",
+              ifelse(bp$home_team == "CLE","indians",
+              ifelse(bp$home_team == "LAD","dodgers",
+              ifelse(bp$home_team == "STL","cardinals",
+              ifelse(bp$home_team == "SF","giants","diamondbacks")))))))))
+bp$team<-bp$home_team
+
+team<-c("reds","cubs","nationals","rockies","pirates","indians","dodgers",
+        "cardinals","giants","diamondbacks")
+
+bp %>% 
+  filter(hard_hit_bip == 1) %>%
+  mlbam_xy_transformation() %>%  
+  ggplot(aes(x=hc_x_, y=hc_y_, color=team)) + 
+  geom_spraychart(mapping = aes(shape=team), 
+                  stadium_ids = unique(bp$home_team),
+                  stadium_transform_coords = TRUE, 
+                  stadium_segments = "all", size=5) + 
+  theme_void() + 
+  coord_fixed() + 
+  facet_wrap(~team) + 
+  theme(legend.position = "bottom") + 
+  stat_density2d(color='gray') +
+  ggtitle("Nick Castellanos Hard Hit Balls in Play by Divisional Ball Parsk") +
+theme(plot.title = element_text(size=10))
+
+
+
+
+```
+
+On the contrary, we can see Eric Hosmer's hard hit ground balls at Petco. If he were to increase his launch angle by nearly ~4 to 6 degrees at least, he'd have a lot more hits. 
+
+```{r a6,echo=FALSE,message=FALSE,warning=FALSE}
+
+#unique(subset(bip,bip$batter == "543333")$home_team)
+
+bp<-subset(bip,bip$batter == "543333")
+bp<-subset(bp,bp$home_team %in% c('SD','LAD','SF','ARI','COL'))
+
+bp$home_team<-ifelse(bp$home_team == "HOU","astros",
+              ifelse(bp$home_team == "CHC","cubs",
+              ifelse(bp$home_team == "MIL","brewers",
+              ifelse(bp$home_team == "COL","rockies",
+              ifelse(bp$home_team == "PIT","pirates",
+              ifelse(bp$home_team == "SD","padres",
+              ifelse(bp$home_team == "LAD","dodgers",
+              ifelse(bp$home_team == "TEX","rangers",
+              ifelse(bp$home_team == "SF","giants","diamondbacks")))))))))
+bp$team<-bp$home_team
+bp$team2<-bp$home_team
+
+team1<-c("astros","cubs","brewers","dodgers",
+        "giants","diamondbacks")
+
+team2<-c("rockies","pirates","padres","rangers")
+
+#,"rockies","pirates","padres","rangers"
+bp1<-bp %>%
+  filter(home_team %in% c('astros','brewers','cubs','diamondbacks','dodgers','giants','rockies','pirates','padres','rangers'))
+
+bp2<-bp %>%
+  filter(home_team %in% c("rockies","pirates","padres","rangers"))
+
+g1<-bp1 %>% 
+  filter(hard_hit_bip == 1 &
+           home_team %in% c('diamondbacks','dodgers','giants','rockies','padres')) %>%
+  mlbam_xy_transformation() %>%  
+  ggplot(aes(x=hc_x_, y=hc_y_, color=team)) + 
+  geom_spraychart(mapping = aes(shape=team), 
+                  stadium_ids = unique(bp1$home_team),
+                  stadium_transform_coords = TRUE, 
+                  stadium_segments = "all", size=5) + 
+  theme_void() + 
+  coord_fixed() + 
+  facet_wrap(~team) + 
+  theme(legend.position = "bottom") + 
+  stat_density2d(color='gray') +
+  ggtitle("Eric Hosmer Hard Hit Balls in Play by Divisional Ball Parks") +
+theme(plot.title = element_text(size=10))
+
+g1 
+
+
+
+
+
+```
+
+When we view the percentage of balls in play that result to hits, not surprisingly that those hit to 7,8,9 location (outfielders) result in more hits. A defensive & athletic outfielder can do numbers to reduce hits against. 
+```{r a7,echo=FALSE,message=FALSE}
+
+
+
+bip %>%
+  group_by(hit_location) %>%
+  summarize(N = n(),
+            Hit = sum(Hit),
+            HitPct = round(sum(Hit) / n(),2)) %>%
+  dplyr::arrange(desc(HitPct))%>%
+ kable(caption = "Hit Percenage to Position Location") %>%
+  kable_styling(font_size = 10,bootstrap_options = c("condensed")) %>%
+  footnote(general = "Filtered for balls in play")
+
+
+
+```
+
+
+Not surprising infield shifts work against batters who pull the ball well. In fact, if a player pulls the ball more and infield shift is more effective than that player than one who hits it opposite. Although, those who hit it opposite would indicate they were late on the swing than those who were on top of it.
+```{r a8,echo=FALSE,message=FALSE}
+
+#33 - 100-> LEFT FIELD
+#100 - 150
+#150 - 223
+#125.42 -> dead center
+
+
+bip$hit_position<-ifelse(bip$stand == "L" & bip$hc_x > 150,
+                   "pulled",
+                   ifelse(bip$stand == "R" & bip$hc_x < 100,
+                   "pulled",
+                   ifelse(bip$stand == "L" & bip$hc_x < 100,
+                   "opposite",
+                   ifelse(bip$stand== "R" & bip$hc_x > 150,
+                   "opposite",
+                   ifelse(bip$hc_x > 100 & bip$hc_x < 150,
+                   "center","foul")))))
+                   
+bip %>%
+  filter(complete.cases(hit_position) & 
+           complete.cases(if_fielding_alignment)  &
+           if_fielding_alignment != "" &
+           hit_position != "foul") %>%
+  group_by(hit_position,if_fielding_alignment) %>%
+  summarize(BIP = n(),
+            Hit = sum(Hit),
+            Pct = round(sum(Hit) / n(),2)) %>%
+  arrange(desc(Pct)) %>%
+ kable(caption = "Hit Position by Infield Fielding Alignment") %>%
+  kable_styling(font_size = 10,bootstrap_options = c("condensed")) %>%
+  footnote(general = "Filtered for balls in play")
+  
+                
+
+
+
+
+```
+
+### Model Building
+In our EDA, we can determine that hit coordinates (hc_x, hc_y), launch angle, speed and speed angle can be determined to model probability of a hit. Our first model included "batter stand", which we can see was statistically significant and was removed from the final variables selected for our model. 
+```{r a9,echo=FALSE,,essage=FALSE,warning=FALSE}
+
+df_model<-bip %>%
+  select(batter,Hit,hc_x,hc_y,stand,launch_angle,launch_speed,launch_speed_angle) 
+
+#df_model<-na.omit(df_model)
+df_model$hc_x[is.na(df_model$hc_x)]<-mean(df_model$hc_x,na.rm = TRUE)
+df_model$hc_y[is.na(df_model$hc_y)]<-mean(df_model$hc_y,na.rm = TRUE)
+df_model$launch_angle[is.na(df_model$launch_angle)]<-mean(df_model$launch_angle,na.rm = TRUE)
+df_model$launch_speed[is.na(df_model$launch_speed)]<-mean(df_model$launch_speed,na.rm = TRUE)
+df_model$launch_speed_angle[is.na(df_model$launch_speed_angle)]<-mean(df_model$launch_speed_angle,na.rm = TRUE)
+
+n.total<-nrow(df_model)
+
+df_model$Hit<-ifelse(df_model$Hit == 1,"Yes","No")
+df_model$Hit<-as.factor(df_model$Hit)
+
+df_model$u<-runif(n = n.total,min= 0, max=1)
+
+#Create train/test split w/ 70:30 split;
+df.train<-subset(df_model,u < 0.70)
+df.test<-subset(df_model,u >= 0.70)
+
+
+
+
+large_model<-glm(Hit ~ hc_x + hc_y + stand + launch_angle + launch_speed + launch_speed_angle
+                   ,data=df.train,family="binomial")
+
+summary(large_model)
+
+trim_model<-glm(Hit ~ hc_x + hc_y + launch_angle + launch_speed + launch_speed_angle,data=df.train,family="binomial")
+
+summary(trim_model)
+
+
+
+
+
+```
+
+Now that we have a core formula, we will re-fit the models using 5 cross-fold to make sure to resample appropriately. We will first fit a GLM model to and check it's results. We see that launch speed angle & launch angle are the most important variables in the model. Secondarily, when we run a VIF on the coefficients we see no coefficient is adding extra or inflated weight, which is a good sign. If anything, launch speed angle has the most inflation at 2.34, which may contribute to its overall variable importance but we will keep in the final model. 
+```{r a10,echo=FALSE,message=FALSE,warning=FALSE}
+
+fitControl <- trainControl(## 5-fold CV
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  verboseIter = TRUE)
+
+frm<-formula(Hit ~ hc_x + hc_y + launch_angle + launch_speed + launch_speed_angle)
+
+finalfrm_glm<- train(
+  form = frm,
+  data = data.frame(df.train),
+  method = "glm",
+  na.action = na.pass,
+  trControl = fitControl
+)
+
+summary(finalfrm_glm)
+varImp(finalfrm_glm,scale=FALSE) %>% plot()
+
+car::vif(finalfrm_glm$finalModel)
+
+# no issues of multicollinearity
+
+```
+
+Next we aim to look at other model fitting to see if we get improved accuracy. To do so, we will fit a Naive Bayes model, Gradient Boosted Model, and a Random Forest model. These help to test against simple "linear" fashion of a GLM model. Naive Bayes is a bayesian model that assumes the data set we have is the entire population of data. It is called "Naive" because it assumes all the varaibles are independent of each other. Our VIF calculations help to somewhat confirm that. Gradient Boosting uses an ensemble approach to model fitting and training, which helps to optimize the final prediction coefficients. Random Forests uses a similar appraoch in learning.  
+```{r a11,include=FALSE}
+
+
+finalfrm_nb<- train(
+  form = frm,
+  data = data.frame(df.train),
+  method = "naive_bayes",
+  na.action = na.pass,
+  trControl = fitControl
+)
+
+
+
+```
+
+```{r a12,include=FALSE}
+
+
+finalfrm_gbm<- train(
+  form = frm,
+  data = data.frame(df.train),
+  method = "gbm",
+  na.action = na.pass,
+  trControl = fitControl
+)
+
+```
+
+
+```{r a13,include=FALSE}
+
+finalfrm_rf<- train(
+  form = frm,
+  data = data.frame(df.train),
+  method = "ranger",
+  na.action = na.pass,
+  trControl = fitControl
+)
+
+```
+
+In evaluating our 4 models, we see random Forest is the most accurate in the binary classification of a hit or not at nearly ~90% accuracy. Not surprisingly, Gradient Boost was not far behind. We will be using the random forest model for our model. 
+```{r a14,echo=FALSE,message=FALSE}
+
+model_list <- list(GLM = finalfrm_glm,
+                                    GradientBoost = finalfrm_gbm,
+                   NaiveBayes = finalfrm_nb,
+                   RandomForests = finalfrm_rf)
+
+model_list_resamples <- resamples(model_list)
+#summary(model_list_resamples)
+bwplot(model_list_resamples)
+
+bwplot(model_list_resamples, metric = "Accuracy", main = "Accuracy Among 5 fold CV")
+
+
+## choose the Random Forests given we get the best performance
+
+```
+
+```{r a15,include=FALSE}
+
+bip$hc_x[is.na(bip$hc_x)]<-mean(bip$hc_x,na.rm = TRUE)
+bip$hc_y[is.na(bip$hc_y)]<-mean(bip$hc_y,na.rm = TRUE)
+bip$launch_angle[is.na(bip$launch_angle)]<-mean(bip$launch_angle,na.rm = TRUE)
+bip$launch_speed[is.na(bip$launch_speed)]<-mean(bip$launch_speed,na.rm = TRUE)
+bip$launch_speed_angle[is.na(bip$launch_speed_angle)]<-mean(bip$launch_speed_angle,na.rm = TRUE)
+
+bip$xHit<-predict(finalfrm_rf,bip,type = "prob")
+
+
+bip$Expected_Hit<-ifelse(bip$xHit$Yes > 0.5,"Yes","No")
+bip$Exp_Hit<-ifelse(bip$Expected_Hit == "Yes",1,0)
+bip$Hit_class<-ifelse(bip$Hit == 1,"Yes","No")
+bip$HitAccuracy<-ifelse(bip$Expected_Hit == bip$Hit_class,TRUE,FALSE)
+bip$Expected_Hit<-as.factor(bip$Expected_Hit)
+bip$HitsLoss<-ifelse(bip$Expected_Hit == "Yes" & bip$Hit_class == "No",1,0)
+bip$HitsAdded<-ifelse(bip$Expected_Hit == "No" & bip$Hit_class == "Yes",1,0)
+
+```
+
+### Model Application: Hits Against a shift
+
+In apply our expected hits model, we thus validate that those hit to shallow outfield are more likely to drop for hits even against the shift. Sometimes as we can see the Strategic shift is much more successful in preventing a hit. 
+```{r a16,echo=FALSE,message=FALSE,warning=FALSE}
+
+bip %>%
+  filter(complete.cases(if_fielding_alignment) &
+           if_fielding_alignment != "") %>%
+spray_chart(aes(x=hc_x,y=-hc_y)) +
+  geom_point(aes(color=Expected_Hit),alpha=1/10) +
+  #scale_color_grey() +
+  theme(legend.position = "bottom") +
+ facet_wrap(~if_fielding_alignment,labeller = label_both) +
+  ggtitle("Expected Hits vs Infield Shift") +
+theme(plot.title = element_text(size=10))
+
+
+```
+
+Similar to Infield shift we see that a strategic shift can help to limit some of the line drive hits but generally the effectiveness is about the same, which may indicate and outfield strategic shift complements and infield shift.  
+```{r a17,echo=FALSE,message=FALSE,warning=FALSE}
+
+bip %>%
+  filter(complete.cases(of_fielding_alignment) &
+           of_fielding_alignment != "") %>%
+spray_chart(aes(x=hc_x,y=-hc_y)) +
+  geom_point(aes(color=Expected_Hit),alpha=1/10) +
+  #scale_color_grey() +
+  theme(legend.position = "bottom") +
+ facet_wrap(~of_fielding_alignment,labeller = label_both) +
+  ggtitle("Expected Hits vs Outfield Shift") +
+theme(plot.title = element_text(size=10))
+
+
+```
+
+### Model Application: Optimizing Launch Angle & Speed
+
+This chart is likely the most important in showing range of launch angle and launch speed or exit velocity. It shows line drives (10-26) and hard hit balls (>95) result in more expected hits for balls in play.  
+```{r a18,echo=FALSE,message=FALSE,warning=FALSE}
+
+
+bip %>%
+  ggplot(aes(x=launch_speed,y=launch_angle,color=Expected_Hit)) +
+  geom_point(alpha=1/10) +
+  stat_ellipse() +
+  ggtitle("Expected Hits by Launch Angle & Speed") +
+theme(plot.title = element_text(size=10))
+
+```
+
+A median Launch Angle of 14 & Launch Speed of 98 would classify it as a hard hit line drive just above the fielders heads given 10 degrees is the starting value for line drive classifications. We would suggest that batters target above 14-20 in launch angle while maintaining a hard hit ball. Easier said than done of course. 
+```{r a19,echo=FALSE,message=FALSE,warning=FALSE}
+
+bip %>%
+  dplyr::group_by(Expected_Hit) %>%
+  dplyr::summarize(`Expected Hits` = n(),
+            Hits = sum(Hit),
+            `LA Median` = round(median(launch_angle),1),
+            `LS Median` = round(median(launch_speed),1),
+            `LSA Median` = round(mean(launch_speed_angle),1),
+            ) %>%
+  kable(caption = "Expected Hit Metrics") %>%
+  kable_styling(font_size = 10,bootstrap_options = c("condensed"))  %>%
+   add_header_above(c(" " = 3, "Launch Angle" = 1, "Launch Speed" = 1, "Launch Speed Angle" = 1))
+
+```
+
+### Model Application: Hits Added
+
+Bryan Reynolds has added the most hits this year above expected at 9. This means he had a hit when the model expected a non hit. 
+
+```{r a20,echo=FALSE,message=FALSE,warning=FALSE}
+
+
+a<-bip %>%
+  group_by(batter,PLAYERNAME,TEAM,ALLPOS) %>%
+  summarize(HitsAdded = sum(HitsAdded)) %>%
+  arrange(desc(HitsAdded)) %>%
+  filter(batter == "668804")
+
+
+a %>%
+  select(batter,PLAYERNAME,TEAM,ALLPOS,HitsAdded) %>%
+    kable(caption = "Top Player with most Hits Added vs. Expected") %>%
+  kable_styling(font_size = 10,bootstrap_options = c("condensed")) 
+
+
+
+
+
+
+```
+Majority of his hits are to shallow outfield, proving our theory that you can add hits even against the shift with proper launch angles. He also likely had lower launch angles and lower launch speed that may have dropped in given its specific location on the field. 
+```{r a21,echo=FALSE,message=FALSE,warning=FALSE}
+
+#unique(subset(bip,bip$batter == "668804")$home_team)
+
+bp<-subset(bip,bip$batter == "668804")
+
+bp<-subset(bp,bp$home_team %in% c("PIT","CIN","CHC","MIL","STL"))
+
+bp$home_team<-ifelse(bp$home_team == "PIT","pirates",
+              ifelse(bp$home_team == "CIN","reds",
+              ifelse(bp$home_team == "CHC","cubs",
+              ifelse(bp$home_team == "MIL","brewers","cardinals"))))
+bp$team<-bp$home_team
+
+team<-c("pirates","reds","cubs","brewers","cardinals")
+
+bp %>% 
+  mlbam_xy_transformation() %>%  
+  ggplot(aes(x=hc_x_, y=hc_y_, color=team)) + 
+  geom_spraychart(mapping = aes(shape=team), 
+                  stadium_ids = unique(bp$home_team),
+                  stadium_transform_coords = TRUE, 
+                  stadium_segments = "all", size=5) + 
+  theme_void() + 
+  coord_fixed() + 
+  facet_wrap(~team) + 
+  theme(legend.position = "bottom") + 
+  stat_density2d(color='gray') +
+  ggtitle("Bryan Reynolds Balls in Play by Divisional Ball Park") +
+theme(plot.title = element_text(size=10))
+
+
+```
+
+### Model Application: Evaluating Upcoming Free Agents 
+
+In Evaluating 2022 FAs, we see Nick Castellanos & JD Martinez would be great consistent hitters to add to the lineup w/ >60% of hard hits falling into play. Nick Castellanos is one of the youngest players on this list indicating him as a prime target to insert into the lineup. It's surprising to Corey Seager, 2020 World Series MVP so low on this list. A core reason may be opposing pitchers ability to shift and turn his hard hits into ground balls. 
+
+```{r a22,echo=FALSE,message=FALSE}
+
+### evaluating potential 2022 FAs hard hit percentage
+
+FA<-bip %>%
+  filter(bip$PLAYERNAME %in% c('Brandon Belt','Matt Carpenter','Freddie Freeman',
+'Yuli Gurriel','Albert Pujols','Anthony Rizzo','Danny Santana','Starlin Castro',
+'Wilmer Flores','Greg Garcia','Josh Harrison','Dustin Pedroia','Donovan Solano',
+'Javier Baez','Carlos Correa','Brandon Crawford','Leury Garcia','Jose Iglesias',
+'Francisco Lindor','Miguel Rojas','Corey Seager','Trevor Story',
+'Chris Taylor','Nolan Arenado','Kris Bryant','Eduardo Escobar','Maikel Franco',
+'Josh Harrison','Jose Ramirez','Kyle Seager','Travis Shaw','Tucker Barnhart',
+'Travis d’Arnaud','Yan Gomes','Martin Maldonado','Roberto Perez',
+'Salvador Perez','Manny Pina','Buster Posey','Christian Vazquez',
+'Charlie Blackmon','Kole Calhoun','Mark Canha','Nick Castellanos',
+'Michael Conforto','Khris Davis','Delino DeShields Jr.','Ian Desmond',
+'Corey Dickerson','Dexter Fowler','Avisail Garcia',
+'Leury Garcia','Odubel Herrera','Ender Inciarte','Adam Jones',
+'Starling Marte','J.D. Martinez','Nomar Mazara','Andrew McCutchen',
+'Tommy Pham','Gregory Polanco','Eddie Rosario','Kyle Schwarber',
+'Jorge Soler','Chris Taylor','Yoshi Tsutsugo'))
+
+mlb_salary1<-mlb_salary %>%
+arrange(Player,Season) %>%
+group_by(Player) %>%
+summarize(mean_Salary = mean(Salary), last_Salary = last(Salary))
+
+
+
+FA<-FA%>%
+  left_join(mlb_salary1,FA,by=c("PLAYERNAME" = "Player"))
+
+
+af<-FA %>%
+  dplyr::group_by(batter,PLAYERNAME,TEAM,ALLPOS,BIRTHDATE) %>%
+  dplyr::summarize(hard_hit_bip = sum(hard_hit_bip),
+                   hard_hit = sum(hard_hit),
+                   hard_hit_pct = round(sum(hard_hit) / sum(hard_hit_bip),2),
+                   `Launch Angle Median of Hard Hit BIP` = median(hard_hit_launch_angle,na.rm=TRUE),
+                   `Launch Angle Median of Hard Hit` = median(hard_hit_result_launch_angle,na.rm=TRUE)) %>%
+  dplyr::filter(hard_hit_bip >= 50) %>%
+  dplyr::arrange(desc(hard_hit_pct)) 
+
+af %>%
+  kable(caption = "Hard Hit Percentage for Upcoming 2022 FAs",booktabs = T) %>%
+  kable_styling(font_size = 10,bootstrap_options = c("condensed")) %>%
+   row_spec(which(af$hard_hit_pct <= 0.40),bold = T,color = "white",background = "grey") %>%
+  row_spec(which(af$hard_hit_pct >= 0.60),bold = T,color = "white",background = "green") %>%
+  footnote(general = "Filtered for at least 50 hard hits","Green > 60% Hard Hit Percentage, Orange <45% Hard Hit Percenatage") 
+
+
+```
+
+## Application for Operations
+Hard Hit balls generally result in more hits, this statistic will start to show players with great mechanics and can be used to evaluate current college baseball players ahead of the draft. We would have to look at summer leagues or college baseball data to see if this is readily available to find players with diamond in the rough mechanics. We can also likely find players who were sporatic in hard hit ability as a way to develop their tendancies in the minors. 
