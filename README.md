@@ -1,4 +1,4 @@
-Full report: 
+Full report: https://htmlpreview.github.io/?https://github.com/qmaclean/MLB-Hit-Probability-Model/blob/main/Expected%20Hits%20Model.html
 
 # MLB-Hit-Probability-Model
 The purpose of this analysis is to model the probability of a hit given a ball in play. We will use this model to evaluate and find the batter that had the most hits added vs. expected. We will also see what variables contribute to a higher probability of hits as a way to compare players. We will have data from the current 2021 season through the end of May. The two months of data will be used to build our preliminary model.
